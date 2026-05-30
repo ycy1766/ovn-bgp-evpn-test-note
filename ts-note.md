@@ -333,3 +333,62 @@ zombie 가 0이 아니면 그 환경도 동일 취약 구조. (좀비 자체는 
 - Bug #2110957: https://bugs.launchpad.net/oslo.messaging/+bug/2110957
 - oslo.messaging 2025.1 RabbitMQ guide: https://docs.openstack.org/oslo.messaging/2025.1/admin/rabbit.html
 - gerrit 941996: https://review.opendev.org/c/openstack/oslo.messaging/+/941996
+
+---
+
+## 부록 A — 운영 로그 시그니처 (Loki, 2026-05-25/26 KST)
+
+본 incident 의 로그 증거. Loki 쿼리 → conductor 컨테이너의 oslo.messaging ERROR + 같은 시간대 nova-compute 의 periodic_task ERROR 가 1:1 짝을 이루고 모두 **동일한 reply queue 하나**(`reply_2facd0a5f40c4021867af6e4ceb5bc24`)를 가리킨다. = §2.4 outage chain 의 실측 재현.
+
+### A.1 쿼리
+```logql
+{service_name="nova", level="ERROR"} != `ERROR neutron.agent.ovn.metadata.server_socket`
+```
+시간창 2026-05-25 23:02 ~ 2026-05-28 16:27 KST · Total: 6.45K · log_volume = error.
+
+### A.2 두 줄짜리 시그니처 (이 한 쌍이 이 incident 의 지문)
+publish 측(conductor) — reply 큐가 사라져 반송:
+```
+ERROR oslo_messaging._drivers.amqpdriver
+  The reply <msg_id> failed to send after 60 seconds due to a missing queue
+  (reply_2facd0a5f40c4021867af6e4ceb5bc24). Abandoning...
+  : oslo_messaging.exceptions.MessageUndeliverable
+```
+consumer 측(nova-compute) — 응답 영원히 못 받아 timeout:
+```
+ERROR oslo_service.periodic_task
+  Error during ComputeManager.<task>:
+  oslo_messaging.exceptions.MessagingTimeout: Timed out waiting for a reply
+  to message ID <msg_id>
+```
+주기적 task 가 줄줄이 같은 패턴으로 실패: `_instance_usage_audit` / `_sync_power_states` / `_reclaim_queued_deletes` / `update_available_resource` / `_run_pending_deletes` / `_check_instance_build_time`.
+
+### A.3 로그가 확정하는 사실
+| 관측 | 의미 |
+|---|---|
+| 모든 `MessageUndeliverable` 가 **같은 reply queue** `reply_2facd0a5...` 를 가리킴 | 죽은 큐는 **단 한 개** — 한 노드(=cnode003-itl) 의 한 reply queue 가 모든 timeout 의 진원 |
+| 죽은 큐 주인 = nova-compute **PID 22555**, `req-e29ce3ba-431a-4ca6-83f6-49c9f41f26d8` | 보고서가 지목한 cnode003-itl PID 22555 와 일치. 큐 주인이 **살아있는 장기 프로세스**임이 로그로 확정 (= §2.5 의 "주인 살아있는" 케이스) |
+| conductor 다중 worker(PIDs 7·8·9·10·11·12·22) 가 **모두** 같은 dead 큐로 reply 시도 | 어느 conductor 가 처리하든 결국 그 compute 의 단일 reply 큐로 보내야 함 → conductor 측 문제 아님이 확정 |
+| 1분 주기로 다른 periodic task 가 timeout | compute 의 모든 RPC 가 마비된 "전면" 상태 (특정 호출만 깨진 게 아님) |
+| 60초 timeout → Abandoning | `direct_mandatory_flag` 의 의도된 mandatory 반송 동작 (impl_rabbit.py:1713 + amqpdriver.py:229-234) |
+
+### A.4 우리 분석과의 1:1 매핑
+| 분석 단계 (§2.4) | Loki 로그 |
+|---|---|
+| reply_CCC 가 삭제됨 | conductor: `missing queue (reply_2facd0a5...)` |
+| connection 살아있어 oslo 재선언 안 함 | 같은 큐 이름으로 **분 단위 무한 재시도**(이름 캐시) |
+| conductor mandatory 반송 | `MessageUndeliverable ... Abandoning` |
+| compute 영구 timeout | `MessagingTimeout` × periodic task 전부 |
+
+### A.5 알람·탐지용 시그니처 (재발 조기 탐지)
+```logql
+# (P1) 죽은 reply 큐 발견 — 가장 강한 신호
+{service_name="nova", logger="oslo_messaging._drivers.amqpdriver", level="ERROR"}
+  |~ "failed to send after .* due to a missing queue \\(reply_"
+
+# (P2) 같은 compute 의 동시다발 periodic task timeout
+{service_name="nova", logger="oslo_service.periodic_task", level="ERROR"}
+  |~ "MessagingTimeout: Timed out waiting for a reply"
+```
+권장 알람: (P1) 동일 `reply_<id>` 가 **3분 내 5건 이상** = 노드 영구 마비 확정 신호 → 해당 reply_id 의 주인 nova-compute Pod 재시작(즉시조치) + 4종 세트 적용 진행.
+
