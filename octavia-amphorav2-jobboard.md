@@ -17,34 +17,63 @@ amphorav2 + jobboard는 flow 상태를 **MariaDB(persistence) + Redis(jobboard)*
 
 ### Before (V1 = amphora driver, jobboard 없음)
 
-```
-                  RPC cast (RabbitMQ)
-openstack API  ───────────────────────►  octavia-worker
-                                          ├─ failover flow 를 "프로세스 메모리"에서 실행
-                                          └─ 상태 저장 X
-                                          ✗ worker 죽으면 → flow 증발, 이어받을 주체 없음
-                                          → LB provisioning_status = PENDING_UPDATE (영구)
-                                          → health_manager: "immutable ... Skipping failover" 무한반복
-                                          → 복구하려면 사람이 DB UPDATE 로 상태 강제 리셋
+flow 상태가 **worker 프로세스 메모리에만** 존재 → worker가 죽으면 증발 → LB 박제.
+
+```mermaid
+flowchart TB
+    API["octavia-api"]
+    MQ{{"RabbitMQ<br/>(oslo.messaging)"}}
+    W["octavia-worker<br/>flow = 프로세스 메모리(휘발)"]
+    DB[("MariaDB · octavia")]
+    API -->|RPC cast| MQ --> W
+    W --> DB
+    W -.->|"worker 사망 → flow 증발<br/>이어받을 주체 없음"| STUCK["❌ LB PENDING_UPDATE<br/>immutable 영구 박제<br/>→ 수동 DB reset 필요"]
+    classDef bad fill:#fde2e2,stroke:#e74c3c,color:#900;
+    class STUCK bad
 ```
 
 ### After (V2 = amphorav2 driver + jobboard)
 
-```
-openstack API ──► Jobboard(Redis) ──► octavia-worker(conductor)
-                  job 등록             ├─ job claim (TTL=30s, keepalive 갱신)
-                  flow 상태는          ├─ flow 실행, 각 task 상태를
-                  MariaDB(persistence) │   octavia-persistence DB 에 기록
-                  에 영속              └─ ✗ worker 죽으면
-                                          → claim TTL 만료
-                                          → 다른 worker 가 job 재claim
-                                          → persistence DB 의 마지막 상태부터 resume
-                                          → LB 가 ACTIVE 로 정상 수렴 (사람 개입 불필요)
+flow 상태가 **Redis(job/claim) + MariaDB persistence(실행 상태)** 에 영속 → worker가 죽어도 다른 worker가 이어받음.
+
+```mermaid
+flowchart TB
+    API["octavia-api"]
+    subgraph WK["octavia-worker (conductor) ×3"]
+        W1["worker #1"]
+        W2["worker #2"]
+    end
+    subgraph REDIS["Redis · redis-systems (jobboard)"]
+        direction LR
+        MA[("master")]
+        RA[("replica")]
+        RB[("replica")]
+        SE{{"sentinel ×3<br/>자동 failover"}}
+        MA --- RA
+        MA --- RB
+        SE -.->|"감시 / 승격"| MA
+    end
+    PDB[("MariaDB · octavia-persistence<br/>logbooks / flowdetails / atomdetails")]
+    DB[("MariaDB · octavia")]
+    API -->|"① job 등록"| MA
+    MA -->|"② claim (TTL 30s)"| W1
+    W1 -->|"③ flow 상태 영속화"| PDB
+    W1 --> DB
+    W1 -.->|"④ worker#1 사망 → claim 만료"| MA
+    MA -->|"⑤ 재claim"| W2
+    W2 -->|"⑥ persistence 에서 resume"| OK["✅ LB ACTIVE 자동복귀<br/>(사람 개입 X)"]
+    classDef good fill:#e3f9e5,stroke:#27ae60,color:#060;
+    class OK good
 ```
 
 핵심 차이는 **"flow 상태가 어디에 사느냐"** 다.
-- V1: worker 프로세스 메모리 (휘발성)
-- V2: MariaDB + Redis (영속) → 그래서 복구 가능
+
+| | V1 (amphora) | V2 (amphorav2 + jobboard) |
+|---|---|---|
+| flow 상태 | worker 프로세스 메모리 (휘발) | Redis(job/claim) + MariaDB persistence (영속) |
+| worker 사망 시 | flow 증발 → **PENDING_UPDATE 박제** | 다른 worker 재claim → **resume** |
+| task 실패 시 | PENDING 박제 가능 | **ERROR**(mutable) → 재시도 가능 |
+| 복구 | 수동 DB reset | 자동 (또는 failover 재시도) |
 
 ---
 
@@ -53,37 +82,62 @@ openstack API ──► Jobboard(Redis) ──► octavia-worker(conductor)
 genestack / vexxhost atmosphere 와 동일하게 **ot-container-kit(opstree) redis-operator** 를 사용한다.
 `redis-systems` 네임스페이스에 3개 컴포넌트를 띄운다.
 
-```
-namespace: redis-systems
-┌──────────────────────────────────────────────────────────────┐
-│ redis-operator          (Deployment, replicas=1)              │
-│   - RedisReplication / RedisSentinel CRD 를 watch & reconcile │
-│   - master/replica role 라벨 관리                              │
-├──────────────────────────────────────────────────────────────┤
-│ RedisReplication "redis-replication" (clusterSize=3)          │
-│   redis-replication-0  ← master  (redis-role=master)          │
-│   redis-replication-1  ← replica                              │
-│   redis-replication-2  ← replica                              │
-│                                                               │
-│   생성되는 Service:                                            │
-│     redis-replication-master   ← 항상 현재 master pod 를 가리킴 │ ★ octavia 가 여기 연결
-│     redis-replication-replica  ← replica 들                    │
-│     redis-replication          ← headless                     │
-├──────────────────────────────────────────────────────────────┤
-│ RedisSentinel "redis-sentinel" (clusterSize=3, quorum=2)      │
-│   - redis-replication 을 monitoring                           │
-│   - master 장애 시 새 master 선출 (failover)                   │
-│   - operator 가 그 결과로 master 라벨/서비스를 갱신            │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph NS["namespace: redis-systems"]
+        OP["redis-operator<br/>(Deployment ×1)<br/>CR watch · master 라벨 관리"]
+        subgraph REPL["RedisReplication (clusterSize 3)"]
+            M[("redis-replication-0<br/>role: master")]
+            S1[("redis-replication-1<br/>replica")]
+            S2[("redis-replication-2<br/>replica")]
+            M -->|복제| S1
+            M -->|복제| S2
+        end
+        subgraph SEN["RedisSentinel (×3, quorum 2)"]
+            SE["sentinel-0/1/2"]
+        end
+        SVC(["svc: redis-replication-master<br/>:6379 → 항상 현재 master"])
+        OP -.->|reconcile| REPL
+        OP -.->|reconcile| SEN
+        SE -.->|"master 감시"| M
+        SE ==>|"master 장애 시<br/>replica 승격 + 라벨 갱신"| OP
+        SVC --> M
+    end
+    OW["octavia-worker<br/>(redis-systems 밖, openstack ns)"]
+    OW -->|"jobboard 연결<br/>redis-replication-master:6379"| SVC
+    classDef svc fill:#e8f0fe,stroke:#4285f4,color:#1a3c8c;
+    class SVC svc
 ```
 
-### 왜 이 3개가 다 필요한가
+> octavia는 **`redis-replication-master` 서비스 하나**에만 연결한다. master가 0→1로 failover돼도 operator가 이 서비스를 새 master로 갱신하므로 octavia 설정은 그대로다 (HA가 서비스 레이어에서 추상화).
+
+### 왜 이 3개가 다 필요한가 (구성 옵션 A/B/C)
 
 | 컴포넌트 | 역할 | 없으면 |
 |---|---|---|
-| **redis-operator** | CRD 해석 + 라이프사이클 관리 | RedisReplication/Sentinel CR이 아무 동작 안 함 |
-| **RedisReplication** | master 1 + replica 2 (데이터 복제) | jobboard 데이터 저장소 자체가 없음 |
-| **RedisSentinel** | master 장애 자동 failover + master 서비스 갱신 | master 죽으면 `redis-replication-master` 가 죽은 pod 가리킴 → jobboard 마비 |
+| **redis-operator** | CRD 해석 + 라이프사이클 관리 (항상 필수) | RedisReplication/Sentinel CR이 아무 동작 안 함 |
+| **RedisReplication** | master 1 + replica N (데이터 복제) | jobboard 데이터 저장소 자체가 없음 |
+| **RedisSentinel** | master 장애 **자동 failover**(replica 승격) + master 서비스 갱신 | 복제는 되지만 master 죽으면 자동 승격 X |
+
+> 공식 문서: **RedisReplication 단독은 자동 failover 없음.** Sentinel이 그걸 담당하며, Sentinel은 Replication이 선행돼야 함.
+
+구성 레벨은 3가지 중 선택 가능하다:
+
+```
+A. Standalone (redis 1 pod)     B. Replication only          C. Replication + Sentinel ★현재/genestack/atmosphere
+   복제 X / 자동failover X         복제 O / 자동failover X         복제 O / 자동failover O
+   이미지 2 (operator+redis)      이미지 2                       이미지 3 (+sentinel)
+```
+
+| | A 단독 | B 복제 | C 복제+센티널 |
+|---|---|---|---|
+| octavia jobboard 동작 | ✅ | ✅ | ✅ |
+| 데이터 이중화 | ❌ | ✅ | ✅ |
+| master 자동 failover | ❌ | ❌ | ✅ |
+
+- **octavia 관점에선 A/B/C 모두 "redis 주소 하나"로 동일하게 보인다** (octavia는 `redis-replication-master` 서비스에만 연결, sentinel 프로토콜은 몰라도 됨). 차이는 *그 뒤 redis가 죽었을 때 자동복구 여부*뿐.
+- **TC-1/TC-2는 octavia worker를 죽이지 redis를 안 죽이므로**, jobboard 기능 검증에는 redis HA가 영향 없음 → 기능만이면 A로도 before/after가 나온다.
+- **본 환경은 C 채택** (genestack/atmosphere와 동일, 운영 그대로 이전 목적).
 
 ### octavia 가 Redis 에 연결되는 경로
 
@@ -225,9 +279,35 @@ octavia 가 **이미 떠 있는** 상태라 순서가 중요하다.
         openstack loadbalancer provider list   # amphorav2 보여야
 ```
 
-미러링 필요 (내부 레지스트리):
-- 차트: `redis-operator:0.24.0`, `redis-replication:0.17.0`, `redis-sentinel:0.16.12` (ot-helm)
-- 이미지: `quay.io/opstree/redis-operator:v0.24.0`, `redis:v8.2.2`, `redis-sentinel:v8.2.2`
+---
+
+## 6-1. 외부 → 내부(Harbor) 미러링 대상
+
+### 📦 Helm 차트 3개 — image-creator 워크플로우 "외부 Helm Repo에 있는 Chart를 Harbor로 업로드"
+
+ot-helm은 **비-OCI(https) repo** → 워크플로우가 subpath 없이 `<project>/<chart>` 로 flat 하게 push.
+따라서 HelmRelease `chart:` 도 flat (`redis-operator`, prefix 없음). (같은 repo 의 `chart: octavia` 와 동일 패턴)
+
+워크플로우 입력 **4개 필드** (차트별):
+
+| 필드 | redis-operator | redis-replication | redis-sentinel |
+|---|---|---|---|
+| `repo` | `https://ot-container-kit.github.io/helm-charts` | (동일) | (동일) |
+| `chart` | `redis-operator` | `redis-replication` | `redis-sentinel` |
+| `version` | `0.24.0` | `0.17.0` | `0.16.12` |
+| `harbor-project` | `kt-cloud-stack` | `kt-cloud-stack` | `kt-cloud-stack` |
+
+→ 결과 경로: `harbor.../kt-cloud-stack/redis-operator:0.24.0` 등 → HelmRelease `chart: redis-operator` 로 참조.
+
+### 🐳 컨테이너 이미지 3개 (이미지 업로드 워크플로우 별도)
+
+| 소스 | 타겟 (내부) | 쓰는 곳 |
+|---|---|---|
+| `quay.io/opstree/redis-operator:v0.24.0` | `…/kt-cloud-stack/redis-operator/redis-operator:v0.24.0` | operator + 모든 redis/sentinel pod init container |
+| `quay.io/opstree/redis:v8.2.2` | `…/kt-cloud-stack/opstree/redis:v8.2.2` | replication |
+| `quay.io/opstree/redis-sentinel:v8.2.2` | `…/kt-cloud-stack/opstree/redis-sentinel:v8.2.2` | sentinel |
+
+> exporter(`quay.io/opstree/redis-exporter:v1.44.0`)는 `redisExporter.enabled:false` 라 Phase 1 불필요.
 
 ---
 
@@ -333,6 +413,70 @@ mysql ... -e "SHOW TABLES IN \`octavia-persistence\`;"               # logbooks/
 openstack loadbalancer provider list                                # amphorav2 노출
 openstack loadbalancer create ... && openstack loadbalancer show <id> -c provider  # amphorav2
 ```
+
+---
+
+## 9. Redis(jobboard) 데이터 검증
+
+jobboard는 Redis에 **job 목록 + claim(소유 worker) + TTL** 을, 실행 상태는 MariaDB persistence에 저장한다.
+
+```mermaid
+flowchart LR
+    OP["LB 작업<br/>(create/failover)"] -->|"job 등록/claim"| R[("Redis<br/>octavia_jobboard.*<br/>job + owner + TTL 30s")]
+    OP -->|"flow/atom 상태"| D[("MariaDB<br/>octavia-persistence<br/>logbooks/flowdetails/atomdetails")]
+    R -.->|"작업 중에만 존재<br/>완료 시 삭제"| X["(idle 시 비어있음)"]
+    D -.->|"RUNNING → 완료 시 정리"| X
+```
+
+```bash
+RC="kubectl -n redis-systems exec redis-replication-0 -- redis-cli"
+$RC DBSIZE
+$RC KEYS 'octavia_jobboard*'            # listings(job) / owners(claim)
+$RC HGETALL octavia_jobboard.listings   # 등록된 job
+$RC HGETALL octavia_jobboard.owners     # claim 한 worker + TTL
+
+# ★ 라이브: 한 터미널에서 MONITOR, 다른 터미널에서 failover → HSET/EXPIRE/HDEL 흐름 관찰
+$RC MONITOR
+```
+- **idle**: listings 비어있음 = flowdetails Empty 와 동일한 그림
+- **작업 중**: job 등장 → claim(TTL) → 완료 후 삭제. 이게 jobboard가 Redis를 실제로 쓰는 증거.
+
+### 실측 검증 결과 (2026-06-20)
+- LB 생성 중 `flowdetails` 에 `state: RUNNING (get_create_load_balancer_flow)` → 완료 후 Empty ✅
+- failover 시 worker 로그에 `RedisJob: get_failover_LB_flow-...` + `taskflow.conductors.backends.impl_executor` → **jobboard conductor 가 Redis job 을 정상 실행** ✅
+- 단, failover 의 nova-build task 가 `NoValidHost`(zone A 2대 + anti-affinity) 로 실패 → LB `ERROR`(박제 아님) → **V2 동작 정상, 실패는 nova 자원 제약(별개)**
+
+---
+
+## 10. Phase 2 — TLS / 모니터링 / HA 검증
+
+Phase 1은 **평문·무인증**(`endpoints.valkey.password: null`). 운영 전 Phase 2에서 보안·관측성·HA를 마무리한다.
+
+```mermaid
+flowchart LR
+    subgraph P1["Phase 1 (현재) — 평문"]
+        WA["octavia-worker"] -->|"6379 평문"| RA[("redis-replication-master")]
+    end
+    subgraph P2["Phase 2 — TLS"]
+        CM["cert-manager<br/>Certificate"] -.->|"발급"| RB[("redis-replication-master<br/>+ server cert")]
+        CM -.->|"CA"| WB["octavia-worker<br/>+ CA 마운트"]
+        WB -->|"6379 TLS"| RB
+    end
+```
+
+### 체크리스트
+
+| # | 항목 | 내용 |
+|---|---|---|
+| 1 | **Redis TLS** (핵심) | cert-manager Certificate(redis-replication-master SAN) → RedisReplication/Sentinel `tls` 활성 → octavia `jobboard_redis_backend_ssl_options`(ca/cert/key) + worker CA 마운트. ⚠️ taskflow redis SSL 적용 후 worker jobboard 로그 재확인 |
+| 2 | **모니터링** | `redisExporter.enabled: true` + 이미지 `quay.io/opstree/redis-exporter:v1.44.0` 미러 + ServiceMonitor (메모리/연결/복제 lag) |
+| 3 | **Redis HA 검증** | `kubectl delete pod redis-replication-0` → sentinel 승격 + `redis-replication-master` 가 새 master 가리키는지 + 그동안 octavia LB 작업 지속되는지 |
+| 4 | **securityContext 하드닝**(선택) | 현재 Kyverno Audit override 로 통과 → 이미지 non-root 지원 확인 후 securityContext 명시(방어심층) |
+
+### (별개) failover 실동작용 nova 조치
+jobboard와 무관하지만 ACTIVE_STANDBY failover 성공에 필요 (§7 실측에서 `NoValidHost`):
+- amphora가 **zone A 2대(cnode001/002)** 에만 핀 + **anti-affinity** → 교착
+- 해결: `conf.octavia.nova.enable_anti_affinity: false`(dev) **또는** amphora AZ 양쪽 허용 **또는** zone A 호스트 추가
 
 ---
 
