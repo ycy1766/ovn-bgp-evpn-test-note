@@ -11,7 +11,7 @@ KCP 환경에서 OVN Floating IP를 BGP EVPN으로 광고하는 작업을 진행
 | 3 | [03-g1-via-tor.md](./03-g1-via-tor.md) | ToR에 EVPN을 위임하는 G1 방향 (compute IPv4 unicast → ToR Type-5). ToR 인프라 전이라 gw 노드로 시뮬레이션. |
 | 4 | [04-type2-on-compute-type5-on-tor.md](./04-type2-on-compute-type5-on-tor.md) | Hybrid - compute는 Type-2 (pl-cyyoon04 검증 path), 상단은 Symmetric IRB로 Type-5 변환. EVPN 표준 패턴. |
 | 5 | [05-type2-fip-evpn-test-runbook.md](./05-type2-fip-evpn-test-runbook.md) | Type-2 FIP 광고 **동작 런북** (pl-cyyoon04, v5 이미지). 커스텀 OVN 26.03 이미지 교체 → kube-ovn 사전작업 → 호스트 인터페이스/FRR/OVN native 활성화 → FIP ping 검증. 재테스트용 cleanup 포함. |
-| 6 | [06-v7-retest-runbook.md](./06-v7-retest-runbook.md) | **현재(v7) 빌드 재테스트 런북**. v5 대비 변경점(type 컬럼 제거, 스키마 다운그레이드 주의), v7 이미지 배포·검증. 인프라 단계는 05 참조. |
+| 6 | [06-v7-retest-runbook.md](./06-v7-retest-runbook.md) | **v7 이미지 Type-2 FIP 테스트 런북 (standalone, 전체 절차)**. `v1.15.11-evpn-fip-type2-v7` 배포 → 사전작업 → 커널 VRF → 테스트 VM/FIP → gw·compute FRR/호스트 인터페이스 → OVN native 활성화 → FIP ping(ttl 63/64) 검증. v5 대비 `type` 컬럼 제거. |
 
 ## 환경
 

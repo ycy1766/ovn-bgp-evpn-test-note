@@ -1,217 +1,442 @@
-# v7 재테스트 런북 — Type-2 FIP BGP-EVPN (현재 빌드 기준)
+# v7 Type-2 FIP BGP-EVPN 테스트 런북 (현재 이미지 기준, pl-cyyoon04)
 
-[05](./05-type2-fip-evpn-test-runbook.md)의 절차를 **현재(v7) 빌드**로 다시 돌리기 위한 런북. 이미지·스키마·검증 부분만 v7 기준으로 갱신했고, 호스트 인터페이스/FRR/OVN 활성화 같은 **이미지 무관 단계는 05를 그대로 따른다**.
+OVN Native BGP-EVPN을 사용하기 위해 kube-ovn 이미지 내 OVN 버전을 **26.03 이상**으로 올려, OpenStack Floating IP / provider-direct VM을 **EVPN Type-2 (MAC+IP)** 로 광고하는 테스트. 테스트 목적으로 내부 빌드 이미지를 배포 후 확인.
 
-- **대상 이미지**: `docker.io/ycy1766/kube-ovn:v1.15.11-evpn-fip-type2-v7`
-  digest `sha256:ddd150e0d38a9add600892c5d7ca8174093fabdc2ba854947b2ca5cc64f53e42` (레지스트리 게시 완료)
-- **OVN 코드**: `kt-cloud-stack/ovn @ a4f6e9c46` (v7 = upstream/main 위 3커밋), OVN 26.03.90
-- **PR**: <https://github.com/kt-cloud-stack/ovn/pull/1>
+- **변경된 이미지 내용 (diff)**: <https://github.com/ycy1766/ovn/compare/31e11ad65...evpn-fip-type2-upstream-v7>
+- **변경된 이미지**: `docker.io/ycy1766/kube-ovn:v1.15.11-evpn-fip-type2-v7`
+  (digest `sha256:ddd150e0d38a9add600892c5d7ca8174093fabdc2ba854947b2ca5cc64f53e42`, OVN 26.03.90)
 
----
-
-## 0. v7가 v5 이미지와 다른 점 (재테스트 전 필독)
-
-| 항목 | v5 이미지 (`-v5`) | **v7 이미지 (`-v7`)** |
-| --- | --- | --- |
-| SB 스키마 | 21.9.0 **+ `type` 컬럼** | **21.9.0 (type 없음 = upstream 동일)** |
-| `Advertised_MAC_Binding` | `type=ip\|nat` 컬럼 존재 | **`type` 컬럼 없음** |
-| ovn-controller 광고 로직 | type별 게이팅 | **있는 행 전부 Type-2 neighbor 광고, `fdb`만 별도** |
-| 기능 결과 (FIP Type-2) | 동작 | **동일하게 동작** |
-
-> 코드 경로만 정리됐고 **FIP가 Type-2로 광고되는 최종 동작은 동일**하다. 검증 절차에서 `type` 컬럼 조회만 빠진다.
-
-### ⚠️ 스키마 다운그레이드 주의 (v5 → v7 in-place 업그레이드 시)
-
-v5(21.9.0**+type**) → v7(21.9.0**−type**)은 **같은 버전번호·다른 내용**이라 ovsdb-server가 자동 변환을 안 할 수 있다.
-- **예상**: ovn-central은 기존 SB DB를 그대로 로드, v7 northd/controller는 `type`을 안 읽으므로 잔여 컬럼은 무해 → 정상 동작 가능성 높음.
-- **ovn-central이 스키마 불일치로 crash/refuse 시** leader에서 명시 변환:
-  ```bash
-  kubectl -n kube-system exec -it <ovn-central-leader> -c ovn-central -- \
-    ovsdb-tool convert /etc/ovn/ovnsb_db.db /kube-ovn/ovn-sb.ovsschema
-  ```
-  (RAFT면 leader 변환 후 follower 재동기화. 경로는 이미지 내 실제 위치로 확인.)
-- **깨끗하게 가려면**: 재테스트 랩이면 v7로 먼저 배포하고 OVN DB를 새로 올리는 게 가장 단순. NB는 스키마 변경 없음(논리 토폴로지 보존).
+> v5 이미지 대비 v7은 SB `Advertised_MAC_Binding`의 `type` 컬럼이 제거되었다(스키마 = upstream 21.9.0). `advertised_mac` 조회에 `type`이 안 나오는 게 정상이며, FIP Type-2 광고 동작은 동일하다. (full 절차는 [05](./05-type2-fip-evpn-test-runbook.md)와 같고, 본 문서는 v7 이미지로 standalone 수행.)
 
 ---
 
-## 1. 환경 변수 (한 번 설정)
+## 1. 이미지 변경 / 배포
 
-랩에 맞게 채운다. 아래는 pl-cyyoon04 검증값(05 기준).
-```bash
-export IMG_TAG=v1.15.11-evpn-fip-type2-v7
-export VNI=10
-# 노드 services IP (VTEP/BGP)
-export GW_IP=172.16.1.160          # gw, ASN 65000
-export C1_IP=172.16.1.157          # oscompt01, ASN 65001
-export C2_IP=172.16.1.159          # oscompt02, ASN 65001
-# provider LS (external net 매핑) — kubectl-ko nbctl show 로 확인
-export LS=neutron-73dbaf22-d6f7-44c7-82cf-42411c61c71c
-```
-
----
-
-## 2. 이미지 배포
-
-### 2.1 helm override 태그를 v7로
+### 1.1 helm override 태그를 v7로
 `/etc/genestack/helm-configs/kube-ovn/kube-ovn-helm-overrides.yaml`:
 ```yaml
 global:
   registry:
+    #address: docker.io/kubeovn
     address: docker.io/ycy1766
   images:
     kubeovn:
       repository: kube-ovn
       vpcRepository: vpc-nat-gateway
-      tag: v1.15.11-evpn-fip-type2-v7      # ← v7
+      #tag: v1.15.11
+      tag: v1.15.11-evpn-fip-type2-v7
       support_arm: true
       thirdparty: true
+networking:
+  IFACE: "tun"
+  ENABLE_SSL: true
+  OVN_NORTHD_N_THREADS: 2
+ipv4:
+  POD_CIDR: "10.236.0.0/14"
+  POD_GATEWAY: "10.236.0.1"
+  SVC_CIDR: "10.233.0.0/18"
+  JOIN_CIDR: "100.64.0.0/16"
 ```
 
-### 2.2 배포 + 버전/스키마 확인
+### 1.2 배포
 ```bash
 bash /opt/genestack/bin/install-kube-ovn.sh
+```
 
-# OVN 버전
-kubectl-ko nbctl --version | head -1          # ovn-nbctl 26.03.90
-
-# 이미지 반영
-kubectl -n kube-system get ds ovs-ovn ovn-central -o jsonpath='{..image}{"\n"}' | tr ' ' '\n' | sort -u
-
-# ovn-central 정상 + 스키마 (0절 주의)
-kubectl -n kube-system get pod -l app=ovn-central          # 전부 Running
-kubectl-ko sbctl --columns=_uuid,ip,mac,logical_port list Advertised_MAC_Binding
-#  → type 컬럼이 조회에 안 나오면 v7 스키마 반영된 것 = 정상
+### 1.3 OVN 버전 확인
+```bash
+kubectl-ko nbctl --version
+#  ovn-nbctl 26.03.90          ← 버전 확인
+#  Open vSwitch Library 3.7.2
+#  DB Schema 7.18.0
 ```
 
 ---
 
-## 3. kube-ovn 사전작업 (필수, 05 Phase 2와 동일)
+## 2. kube-ovn 사전작업
+
+ovn-controller Pod(ovs-ovn)가 각 호스트의 Netlink로 FDB 정보를 삽입해야 하므로 권한을 추가로 열어준다. (위키 `04. kcp bgp-evpn type-2 / Kube-OVN 사전 작업` 과 동일, Type-5에도 동일 적용.)
+
+### 2.1 ovs-ovn securityContext 수정
+```bash
+kubectl -n kube-system edit daemonset ovs-ovn
+```
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+      - name: openvswitch
+        securityContext:
+          runAsUser: 0
+          privileged: true
+```
+
+### 2.2 소켓/로그 경로 권한 수정 (ovn-central 노드)
+```bash
+for node in 10.21.1.21 10.21.1.22 10.21.1.23; do
+    ssh $node 'chown -R nobody:nogroup /var/run/ovn /var/log/ovn'
+done
+```
+
+### 2.3 변경된 권한 확인
+```bash
+kubectl -n kube-system exec ds/ovs-ovn -c openvswitch -- id
+#  uid=0(root) gid=0(root) groups=0(root)
+
+kubectl -n kube-system get pod -l app=ovn-central
+#  ovn-central-... 1/1 Running (전부 Running)
+```
+
+---
+
+## 3. 커널 VRF 모듈 (gw + 모든 compute 동일)
+
+Ubuntu 기본 커널엔 vrf 모듈이 없어 `linux-modules-extra` 설치 필요.
+```bash
+## 기본 커널에 VRF 미존재
+modprobe vrf vxlan
+#  modprobe: FATAL: Module vrf not found ...
+
+## modules-extra 설치 (vrf 포함)
+apt update && apt install -y linux-modules-extra-$(uname -r)
+
+## 모듈 로드 + 부팅 자동 로드 등록
+echo vrf   | tee /etc/modules-load.d/vrf.conf
+echo vxlan | tee /etc/modules-load.d/vxlan.conf
+
+## ip_forward 활성화
+sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' | tee /etc/sysctl.d/99-evpn.conf
+
+## 확인
+lsmod | egrep 'vrf|vxlan'        # vrf 로드됨
+sysctl net.ipv4.ip_forward       # = 1
+```
+
+---
+
+## 4. 테스트 환경 구성
+
+VM 2대: (1) provider network 직결, (2) FIP 부착.
 
 ```bash
-# (1) ovs-ovn securityContext: runAsUser:0, privileged:true
-kubectl -n kube-system edit daemonset ovs-ovn      # containers[name=openvswitch].securityContext
+## tenant network/subnet
+openstack network create --availability-zone-hint az1 region01-test-network-az1
+openstack subnet create --network region01-test-network-az1 --gateway 192.168.20.1 \
+  --subnet-range 192.168.20.0/24 region01-test-subnet-az1
 
-# (2) ovn-central 노드 host path 소유자
-for node in 10.21.1.21 10.21.1.22 10.21.1.23; do
-  ssh $node 'chown -R nobody:nogroup /var/run/ovn /var/log/ovn'
-done
+## provider network (172.16.1.151 ~ 172.16.1.156)
+openstack network create --share --external --availability-zone-hint az1 \
+  --provider-physical-network physnet1 --provider-network-type flat internal-provider-network
+openstack subnet create --network internal-provider-network \
+  --allocation-pool start=172.16.1.151,end=172.16.1.156 \
+  --dns-nameserver 8.8.4.4 --gateway 172.16.1.254 \
+  --subnet-range 172.16.1.0/24 internal-provider-subnet
 
-# (3) compute ovs-ovn pod 강제 재기동 (좀비 ovn-controller 방지)
-for n in <compute-node-1> <compute-node-2>; do
-  kubectl -n kube-system delete pod -l app=ovs-ovn --field-selector spec.nodeName=$n
+## Router
+openstack router create --availability-zone-hint az1 test-router-az1
+openstack router add subnet test-router-az1 region01-test-subnet-az1
+openstack router set --external-gateway internal-provider-network test-router-az1
+
+## SG
+openstack security group create region01-test-sg
+openstack security group rule create --proto icmp region01-test-sg
+openstack security group rule create --proto tcp  region01-test-sg
+
+## VM (1) tenant + FIP
+openstack server create --flavor ktc-m1.tiny --network region01-test-network-az1 \
+  --image cirros --security-group region01-test-sg --availability-zone az1 region01-vm1
+## VM (2) provider 직결
+openstack server create --flavor ktc-m1.tiny --image cirros \
+  --network internal-provider-network \
+  --availability-zone az1:kdvmd-pl-cyyoon04-oscompt01 test-evpn-vm-direct
+```
+
+```text
+$ openstack server list
+| test-evpn-vm-direct | ACTIVE | internal-provider-network=172.16.1.153   |
+| region01-vm1        | ACTIVE | region01-test-network-az1=192.168.20.121 |
+```
+
+### FIP 생성/부착
+```bash
+openstack floating ip create internal-provider-network        # → 172.16.1.156
+openstack server add floating ip region01-vm1 172.16.1.156
+#  region01-vm1: 172.16.1.156, 192.168.20.121
+```
+
+---
+
+## 5. EVPN 연동 — gw 노드
+
+### 5.1 FRR daemons 활성화
+```bash
+apt update && apt install -y frr
+cat > /etc/frr/daemons <<'EOF'
+bgpd=yes
+ospfd=no
+ospf6d=no
+ripd=no
+ripngd=no
+isisd=no
+pimd=no
+ldpd=no
+nhrpd=no
+eigrpd=no
+babeld=no
+sharpd=no
+pbrd=no
+bfdd=no
+fabricd=no
+vrrpd=no
+pathd=no
+vtysh_enable=yes
+zebra_options="  -A 127.0.0.1 -s 90000000"
+bgpd_options="   -A 127.0.0.1"
+staticd_options="-A 127.0.0.1"
+EOF
+systemctl restart frr
+systemctl status frr | grep -E 'bgpd|zebra'      # zebra/bgpd up
+```
+
+### 5.2 이전 호스트 인터페이스 삭제
+```bash
+VNI=10
+ip link del vxlan-${VNI} 2>/dev/null
+ip link del lo-${VNI}    2>/dev/null
+ip link del br-${VNI}    2>/dev/null
+# VM IP를 br-10으로 보내던 /32 라우트 제거
+for ip in 151 152 153 154 155 156; do ip route del 172.16.1.${ip}/32 dev br-10 2>/dev/null; done
+ip route show | grep -E '172\.16\.1\.(151|152|153|154|155|156)/32' || echo "clean"
+```
+
+### 5.3 호스트 인터페이스 생성
+> br-10에 IP를 주면 services NIC와 같은 서브넷(172.16.1.0/24) 충돌. **br-10은 L2 bridge로만 사용, IP 미부여.** VM 통신 src IP는 services NIC의 172.16.1.160 사용.
+```bash
+VNI=10; LOCAL_IP=172.16.1.160
+ip link add br-10 type bridge && ip link set br-10 up
+ip link add vxlan-10 type vxlan id ${VNI} local ${LOCAL_IP} dstport 4789
+ip link set vxlan-10 master br-10 && ip link set vxlan-10 up
+ip link add lo-10 type dummy
+ip link set lo-10 master br-10 && ip link set lo-10 up
+ip -d link show vxlan-10 | grep dstport       # dstport 4789
+```
+
+### 5.4 호스트 라우팅
+> 테스트 환경상 service/광고 인터페이스가 한 NIC에 몰려있음 (실 환경은 분리 필요). VM IP(151~156)만 br-10으로, VTEP(157/159)·default GW는 services 그대로.
+```bash
+for ip in 151 152 153 154 155 156; do ip route add 172.16.1.${ip}/32 dev br-10 2>/dev/null; done
+```
+
+### 5.5 FRR 설정
+> `frr defaults datacenter` 필수 (traditional이면 정책상 EVPN 차단). `advertise-all-vni` = 로컬 VNI 자동 EVPN 광고.
+```bash
+cat > /etc/frr/frr.conf <<'EOF'
+frr version 8.4.4
+frr defaults datacenter
+hostname kdvmd-pl-cyyoon04-gw
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+router bgp 65000
+ bgp router-id 172.16.1.160
+ no bgp default ipv4-unicast
+ neighbor EVPN peer-group
+ neighbor EVPN remote-as 65001
+ neighbor 172.16.1.157 peer-group EVPN
+ neighbor 172.16.1.159 peer-group EVPN
+ !
+ address-family l2vpn evpn
+  neighbor EVPN activate
+  advertise-all-vni
+ exit-address-family
+!
+EOF
+systemctl restart frr
+```
+
+---
+
+## 6. EVPN 연동 — Compute 노드 (oscompt01 / oscompt02)
+
+### 6.1 이전 호스트 인터페이스 삭제 (양 노드)
+```bash
+VNI=10
+ip link del vxlan-${VNI} 2>/dev/null
+ip link del lo-${VNI}    2>/dev/null
+ip link del br-${VNI}    2>/dev/null
+```
+
+### 6.2 OVS external_ids 초기화 (양 노드)
+```bash
+ovs-vsctl remove Open_vSwitch . external-ids ovn-evpn-local-ip 2>/dev/null
+ovs-vsctl remove Open_vSwitch . external-ids ovn-evpn-vxlan-ports 2>/dev/null
+ovn-appctl -t ovn-controller inc-engine/recompute 2>/dev/null
+ovs-vsctl show | grep -A3 evpn || echo "no evpn port"
+ovn-appctl -t ovn-controller evpn/vtep-binding-list 2>/dev/null     # 비어 있어야
+```
+
+### 6.3 OVN LS dynamic-routing 키 초기화 (ctrl 노드)
+```bash
+LS=neutron-73dbaf22-d6f7-44c7-82cf-42411c61c71c
+for k in dynamic-routing-vni dynamic-routing-bridge-ifname \
+         dynamic-routing-vxlan-ifname dynamic-routing-advertise-ifname \
+         dynamic-routing-redistribute; do
+    kubectl-ko nbctl remove Logical_Switch $LS other_config $k 2>/dev/null
 done
+kubectl-ko nbctl get Logical_Switch $LS other_config     # 키 없어야
+kubectl-ko sbctl find advertised_mac                     # 비어 있어야
+```
+
+### 6.4 호스트 인터페이스 (oscompt01: LOCAL_IP=157 / oscompt02: 159)
+> br-10: L2 학습/광고 bridge. lo-10: static FDB 광고용 dummy(ovn-controller가 `advertised_mac`의 VM MAC을 RTM_NEWNEIGH로 주입). vxlan-10: remote VTEP 학습, `nolearning`으로 FRR static FDB와 자가학습 충돌 회피.
+```bash
+VNI=10; LOCAL_IP=172.16.1.157         # oscompt02는 172.16.1.159
+ip link add br-10 type bridge && ip link set br-10 up
+ip link add vxlan-10 type vxlan id ${VNI} local ${LOCAL_IP} dstport 60010 nolearning
+ip link set vxlan-10 master br-10 && ip link set vxlan-10 up
+ip link add lo-10 type dummy
+ip link set lo-10 master br-10 && ip link set lo-10 up
+ip -d link show vxlan-10 | grep dstport       # dstport 60010
+```
+
+### 6.5 FRR 설정 (oscompt01 예시; oscompt02는 hostname/router-id만 159로)
+```bash
+cat > /etc/frr/frr.conf <<'EOF'
+frr version 8.4.4
+frr defaults datacenter
+hostname kdvmd-pl-cyyoon04-oscompt01
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+router bgp 65001
+ bgp router-id 172.16.1.157
+ no bgp default ipv4-unicast
+ neighbor 172.16.1.160 remote-as 65000
+ !
+ address-family l2vpn evpn
+  neighbor 172.16.1.160 activate
+  advertise-all-vni
+ exit-address-family
+!
+EOF
+systemctl restart frr
+```
+
+---
+
+## 7. BGP-EVPN 세션 확인
+
+```bash
+# gw
+vtysh -c 'show bgp l2vpn evpn summary'
+#  oscompt01(172.16.1.157) ... State/PfxRcd 1   PfxSnt 3
+#  oscompt02(172.16.1.159) ... State/PfxRcd 1   PfxSnt 3
+#  Total number of neighbors 2
+vtysh -c 'show evpn vni'
+#  10  L2  vxlan-10  ...  # Remote VTEPs 2  default
+
+# compute (각 노드)
+vtysh -c 'show evpn vni'
+#  10  L2  vxlan-10  ...  # Remote VTEPs 1  default
+```
+
+---
+
+## 8. OVN Native EVPN 활성화
+
+### 8.1 provider LS에 dynamic-routing 키 추가
+OVN northd가 NB Logical_Switch 설정을 읽어 SB에 광고 엔트리를 생성.
+```bash
+# provider LS 확인 (localnet 포트 보유)
+kubectl-ko nbctl show | grep -A2 "internal-provider"
+#  switch ... (neutron-73dbaf22-...) (aka internal-provider-network)
+#      port provnet-...  type: localnet
+
+LS=neutron-73dbaf22-d6f7-44c7-82cf-42411c61c71c
+kubectl-ko nbctl set Logical_Switch $LS \
+    other_config:dynamic-routing-vni=10 \
+    other_config:dynamic-routing-bridge-ifname=br-10 \
+    other_config:dynamic-routing-vxlan-ifname=vxlan-10 \
+    other_config:dynamic-routing-advertise-ifname=lo-10
+kubectl-ko nbctl set Logical_Switch $LS \
+    other_config:dynamic-routing-redistribute=fdb,ip,nat
 
 # 확인
-kubectl -n kube-system exec ds/ovs-ovn -c openvswitch -- id   # uid=0(root)
+kubectl-ko nbctl get Logical_Switch $LS other_config
+#  {... dynamic-routing-redistribute="fdb,ip,nat", dynamic-routing-vni="10", ...}
 ```
+- `ip`=VIF/router-port, `nat`=분산 FIP(dnat_and_snat), `fdb`=FDB inject. **FIP는 `nat` 토큰 필수.**
 
----
-
-## 4. EVPN 인프라 — **05를 그대로 따름** (이미지 무관)
-
-아래 단계는 v5/v7 동일하므로 [05](./05-type2-fip-evpn-test-runbook.md)의 해당 Phase를 그대로 수행:
-
-- **05 Phase 3** — 커널 VRF 모듈 (`linux-modules-extra`, ip_forward) : gw + 모든 compute
-- **05 Phase 4** — 테스트 VM (provider 직결 1대 + tenant+FIP 1대)
-- **05 Phase 5** — 호스트 인터페이스 트리오 (`br-$VNI` / `vxlan-$VNI` / `lo-$VNI`), gw `/32` 라우트
-- **05 Phase 6** — FRR (gw bgp 65000 / compute bgp 65001, `frr defaults datacenter`, `advertise-all-vni`)
-- **05 Phase 7** — `vtysh -c 'show bgp l2vpn evpn summary'` / `show evpn vni` 세션 확인
-
-> 핵심 함정(05와 동일): `br-$VNI`에 IP 금지, compute vxlan `nolearning`, `frr defaults datacenter`, provider LS에 localnet 포트 필수, ping src는 services IP 명시.
-
----
-
-## 5. OVN Native EVPN 활성화
-
-```bash
-# provider LS에 dynamic-routing 키
-kubectl-ko nbctl set Logical_Switch $LS \
-  other_config:dynamic-routing-vni=$VNI \
-  other_config:dynamic-routing-bridge-ifname=br-$VNI \
-  other_config:dynamic-routing-vxlan-ifname=vxlan-$VNI \
-  other_config:dynamic-routing-advertise-ifname=lo-$VNI
-kubectl-ko nbctl set Logical_Switch $LS \
-  other_config:dynamic-routing-redistribute=fdb,ip,nat
-
-# compute OVS external_ids (ovn-evpn 포트 생성)
-#  oscompt01
-ovs-vsctl set Open_vSwitch . external-ids:ovn-evpn-local-ip=$C1_IP external-ids:ovn-evpn-vxlan-ports=4789
-#  oscompt02
-ovs-vsctl set Open_vSwitch . external-ids:ovn-evpn-local-ip=$C2_IP external-ids:ovn-evpn-vxlan-ports=4789
-```
-- `ip`=VIF/router-port, `nat`=분산 FIP(dnat_and_snat), `fdb`=FDB inject. **FIP는 `nat` 토큰 필수**.
-
----
-
-## 6. v7 검증
-
-### 6.1 SB advertised_mac (v7: type 컬럼 없음)
+### 8.2 SB advertised_mac 자동 등록 확인 (v7: type 컬럼 없음)
 ```bash
 kubectl-ko sbctl find advertised_mac
-#  ip / mac / logical_port / datapath 만 (type 컬럼 없음)
-#  → FIP external_ip/mac 행 + provider 직결 VM 행 등장
 ```
+```text
+_uuid        : cb140430-...
+datapath     : 88bcacc8-...
+ip           : "172.16.1.152"
+logical_port : 64394b09-...
+mac          : "fa:16:3e:f1:df:b4"
 
-### 6.2 호스트 FDB/neighbor (FIP 호스팅 chassis)
-```bash
-ip neigh show dev br-$VNI | grep <FIP>            # Type-2 MAC+IP neighbor
-bridge fdb show dev vxlan-$VNI | grep <FIP-MAC>   # FDB
+ip           : "172.16.1.156"      ← FIP (Type-2 광고 타깃)
+logical_port : 64394b09-...
+mac          : "fa:16:3e:1e:22:45"
+
+ip           : "172.16.1.153"      ← provider 직결 VM
+logical_port : eabe5472-...
+mac          : "fa:16:3e:df:48:35"
 ```
+> v7 출력엔 `type` 컬럼이 없다(스키마에서 제거됨). FIP/직결 VM 행이 정상 등록되면 OK.
 
-### 6.3 FRR EVPN
+### 8.3 ovn-evpn 포트 활성화 (compute)
+`ovn-evpn-local-ip` + `ovn-evpn-vxlan-ports`를 OVS external_ids에 넣으면 ovn-controller가 br-int에 `ovn-evpn-4789` 포트를 자동 생성.
 ```bash
-vtysh -c "show evpn mac vni $VNI" | grep <FIP-MAC>
-vtysh -c 'show bgp l2vpn evpn' | grep <FIP>       # Type-2 (RT-2)
-```
-
-### 6.4 데이터 평면 (gw에서)
-```bash
-ping -I $GW_IP <direct-VM-IP> -c 5     # ttl=64
-ping -I $GW_IP <FIP> -c 5              # ttl=63 (NAT 1홉), 0% loss 기대
-```
-✅ FIP ttl=63 / direct ttl=64, 둘 다 0% loss → **v7로 Type-2 FIP 광고 재현 완료**.
-
----
-
-## 7. cleanup (재테스트 반복 시, 05 Phase 5.1 / 8.1)
-
-```bash
-# OVN 키 제거
-for k in dynamic-routing-vni dynamic-routing-bridge-ifname dynamic-routing-vxlan-ifname \
-         dynamic-routing-advertise-ifname dynamic-routing-redistribute; do
-  kubectl-ko nbctl remove Logical_Switch $LS other_config $k 2>/dev/null
-done
-# compute OVS external_ids 제거 + recompute
-ovs-vsctl remove Open_vSwitch . external-ids ovn-evpn-local-ip
-ovs-vsctl remove Open_vSwitch . external-ids ovn-evpn-vxlan-ports
-ovn-appctl -t ovn-controller inc-engine/recompute
-# 호스트 인터페이스/라우트 삭제 (05 Phase 5.1)
+# oscompt01
+ovs-vsctl set Open_vSwitch . \
+  external-ids:ovn-evpn-local-ip=172.16.1.157 \
+  external-ids:ovn-evpn-vxlan-ports=4789
+# oscompt02
+ovs-vsctl set Open_vSwitch . \
+  external-ids:ovn-evpn-local-ip=172.16.1.159 \
+  external-ids:ovn-evpn-vxlan-ports=4789
 ```
 
 ---
 
-## 부록 A — v7 이미지 빌드 재현 (이미 푸시됨, 필요 시만)
+## 9. VM 통신 테스트
+
+ping src IP는 services 대역(172.16.1.160) 명시. `-I br-10`은 br-10에 IP가 없어 src가 api 대역으로 잡혀 응답이 안 돌아온다. FIP(156)=ttl 63(NAT 1홉), direct(153)=ttl 64.
 
 ```bash
-cd ~/Documents/git/ycy1766/kube-ovn
-export V=v1.15.11-evpn-fip-type2-v7
-# Dockerfile.base의 OVN clone은 a4f6e9c46 핀, OVS 핀 bdb95cc… (수정 불필요)
+# provider 직결 VM → ttl=64
+ping -I 172.16.1.160 172.16.1.153 -c 5
+#  64 bytes from 172.16.1.153: ttl=64 ...
+#  5 packets transmitted, 5 received, 0% packet loss
 
-# (1) base (QEMU amd64, OVS+OVN 컴파일, 수십분)
-docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 \
-  -t ycy1766/kube-ovn-base:$V -o type=docker -f dist/images/Dockerfile.base dist/images/
-# (2) go 바이너리 (호스트 크로스컴파일)
-VERSION=$V make build-go
-# (3) 최종 이미지
-docker buildx build --platform linux/amd64 -t ycy1766/kube-ovn:$V \
-  --build-arg VERSION=$V -o type=docker -f dist/images/Dockerfile dist/images/
-# (4) push
-docker push ycy1766/kube-ovn:$V
+# FIP → ttl=63 (NAT 1홉 경유)
+ping -I 172.16.1.160 172.16.1.156 -c 5
+#  64 bytes from 172.16.1.156: ttl=63 ...
+#  5 packets transmitted, 5 received, 0% packet loss
 ```
-> base 태그는 `-amd64` 접미사 없이(메인 Dockerfile `FROM …:$BASE_TAG`와 맞춤). 브랜치명이 v6와 같아 Dockerfile.base가 SHA(`a4f6e9c46`) checkout으로 캐시 버스트.
 
-## 부록 B — 참고
+✅ FIP(156) ttl=63, direct(153) ttl=64, 둘 다 0% loss → **v7 이미지로 Type-2 FIP 광고 재현 완료.**
 
-- 전체 상세 절차: [05-type2-fip-evpn-test-runbook.md](./05-type2-fip-evpn-test-runbook.md)
-- v7 코드 PR: <https://github.com/kt-cloud-stack/ovn/pull/1>
-- upstream 리뷰(ovs-dev v6 → v7 반영): patchwork series 509976, Ales Musil 리뷰 3코멘트 모두 v7 반영(type 제거 + controller 단순화 + 핸들러 분리).
+---
+
+## 부록 — 핵심 함정
+
+1. **OVN 버전**: stock(25.03) 아닌 26.03 이미지 필수. `nbctl --version`으로 26.03.90 확인.
+2. **ovs-ovn 권한**: `runAsUser:0 + privileged:true` 없으면 RTM_NEWNEIGH 실패 → static FDB inject 안 됨.
+3. **br-10 IP 금지** (services 서브넷 충돌). ping src는 services IP(.160).
+4. **compute vxlan `nolearning`** (FRR static FDB 충돌 회피).
+5. **frr defaults datacenter** (traditional이면 EVPN 차단).
+6. **provider LS에 localnet 포트 필수** (없으면 NAT이 distributed로 안 잡혀 FIP 광고 안 됨).
+7. **재테스트 cleanup 순서**: OVN 키 제거 → OVS external_ids 제거 → 호스트 인터페이스/라우트 삭제.
+8. **v7 스키마**: `Advertised_MAC_Binding`에 `type` 컬럼 없음. v5(type 有) 위에 v7 in-place 배포 시 ovsdb 스키마 처리 주의(필요 시 `ovsdb-tool convert`).
+
+## 부록 — 참고
+- 변경 diff: <https://github.com/ycy1766/ovn/compare/31e11ad65...evpn-fip-type2-upstream-v7>
+- v5 기준 상세 런북: [05-type2-fip-evpn-test-runbook.md](./05-type2-fip-evpn-test-runbook.md)
+- 코드 PR: <https://github.com/kt-cloud-stack/ovn/pull/1>
