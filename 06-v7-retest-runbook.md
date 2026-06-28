@@ -309,10 +309,12 @@ kubectl-ko nbctl get Logical_Switch $LS other_config     # 키 없어야
 kubectl-ko sbctl find advertised_mac                     # 비어 있어야
 ```
 
-### 6.4 호스트 인터페이스 (oscompt01: LOCAL_IP=27 / oscompt02: 28)
+### 6.4 호스트 인터페이스 (oscompt01 / oscompt02)
 > br-10: L2 학습/광고 bridge. lo-10: static FDB 광고용 dummy(ovn-controller가 `advertised_mac`의 VM MAC을 RTM_NEWNEIGH로 주입). vxlan-10: remote VTEP 학습, `nolearning`으로 FRR static FDB와 자가학습 충돌 회피.
+
+**oscompt01** (LOCAL_IP=172.16.1.27):
 ```bash
-VNI=10; LOCAL_IP=172.16.1.27          # oscompt02는 172.16.1.28
+VNI=10; LOCAL_IP=172.16.1.27
 ip link add br-10 type bridge && ip link set br-10 up
 ip link add vxlan-10 type vxlan id ${VNI} local ${LOCAL_IP} dstport 60010 nolearning
 ip link set vxlan-10 master br-10 && ip link set vxlan-10 up
@@ -321,7 +323,20 @@ ip link set lo-10 master br-10 && ip link set lo-10 up
 ip -d link show vxlan-10 | grep dstport       # dstport 60010
 ```
 
-### 6.5 FRR 설정 (oscompt01 예시; oscompt02는 hostname/router-id만 172.16.1.28로)
+**oscompt02** (LOCAL_IP=172.16.1.28):
+```bash
+VNI=10; LOCAL_IP=172.16.1.28
+ip link add br-10 type bridge && ip link set br-10 up
+ip link add vxlan-10 type vxlan id ${VNI} local ${LOCAL_IP} dstport 60010 nolearning
+ip link set vxlan-10 master br-10 && ip link set vxlan-10 up
+ip link add lo-10 type dummy
+ip link set lo-10 master br-10 && ip link set lo-10 up
+ip -d link show vxlan-10 | grep dstport       # dstport 60010
+```
+
+### 6.5 FRR 설정 (oscompt01 / oscompt02)
+
+**oscompt01**:
 ```bash
 cat > /etc/frr/frr.conf <<'EOF'
 frr version 8.4.4
@@ -332,6 +347,29 @@ service integrated-vtysh-config
 !
 router bgp 65001
  bgp router-id 172.16.1.27
+ no bgp default ipv4-unicast
+ neighbor 172.16.1.20 remote-as 65000
+ !
+ address-family l2vpn evpn
+  neighbor 172.16.1.20 activate
+  advertise-all-vni
+ exit-address-family
+!
+EOF
+systemctl restart frr
+```
+
+**oscompt02**:
+```bash
+cat > /etc/frr/frr.conf <<'EOF'
+frr version 8.4.4
+frr defaults datacenter
+hostname kdvmd-pl-cyyoon02-oscompt02
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+router bgp 65001
+ bgp router-id 172.16.1.28
  no bgp default ipv4-unicast
  neighbor 172.16.1.20 remote-as 65000
  !
