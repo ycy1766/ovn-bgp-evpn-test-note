@@ -496,6 +496,8 @@ ping -I 172.16.1.20 <FIP2> -c 5                        # ttl=63 기대(게이트
 - 성공 → 멀티컴퓨트 OK(인바운드는 게이트웨이 중앙집중 hairpin, 진짜 분산 인바운드는 아님 = future optimization).
 - 실패 → VM-chassis 광고 필요(northd advertised_mac을 라우터 포트 대신 `nat->logical_port`(VM 포트)로). native GARP가 `is_chassis_resident(nat->logical_port)`인 점과 일치시키는 방향.
 
+**실측 결과 (2026-06-28, pl-cyyoon02)**: `region01-vm2`(host=oscompt01, FIP 172.16.1.38/fa:16:3e:c8:37:f4) — advertised_mac `logical_port=5a9cd150`(라우터 포트, 게이트웨이 고정), gw 학습 `[2]:…[32]:[172.16.1.38]`, **`ping 172.16.1.38` → ttl=63, 0% loss**. ✅ **VM≠게이트웨이에서도 정상 = 게이트웨이 hairpin 동작 실증.** (근거: `build_lrouter_in_dnat_flow`가 distributed면 DNAT를 chassis 고정 안 함.) 인바운드 중앙집중은 스케일 관점 future optimization(VM-chassis 광고)일 뿐 정확성 문제 아님.
+
 ---
 
 ## 10. 트러블슈팅 — control plane vs data plane
