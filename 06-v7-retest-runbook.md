@@ -92,6 +92,7 @@ kubectl -n kube-system exec ds/ovs-ovn -c openvswitch -- id
 kubectl -n kube-system get pod -l app=ovn-central
 #  ovn-central-... 1/1 Running (전부 Running)
 ```
+> ⚠️ securityContext 변경 직후 `/var/run/ovn`·`/var/log/ovn`이 root 소유로 바뀌어 **ovn-central이 CrashLoopBackOff** 날 수 있다. 위 2.2 chown(nobody:nogroup) 적용하면 회복된다(실측: 3 replica 전부 Running 복귀).
 
 ---
 
@@ -293,9 +294,9 @@ ovn-appctl -t ovn-controller evpn/vtep-binding-list 2>/dev/null     # 비어 있
 
 ### 6.3 OVN LS dynamic-routing 키 초기화 (ctrl 노드)
 ```bash
-# provider LS UUID 확인 (pl-cyyoon02 실값으로)
+# provider LS UUID 확인 (pl-cyyoon02 실값)
 LS="neutron-$(openstack network show internal-provider-network -f value -c id)"
-#  또는: kubectl-ko nbctl show | grep -B1 'type: localnet'
+#  = neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a
 echo $LS
 for k in dynamic-routing-vni dynamic-routing-bridge-ifname \
          dynamic-routing-vxlan-ifname dynamic-routing-advertise-ifname \
@@ -371,6 +372,7 @@ kubectl-ko nbctl show | grep -B1 'type: localnet'
 #  switch <uuid> (neutron-<provider-net-uuid>) (aka internal-provider-network)
 
 LS="neutron-$(openstack network show internal-provider-network -f value -c id)"
+#  = neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a
 kubectl-ko nbctl set Logical_Switch $LS \
     other_config:dynamic-routing-vni=10 \
     other_config:dynamic-routing-bridge-ifname=br-10 \
@@ -392,12 +394,12 @@ kubectl-ko sbctl find advertised_mac
 ```text
 _uuid        : <uuid>
 datapath     : <provider LS datapath>
-ip           : "172.16.1.32"       ← FIP (Type-2 광고 타깃, oscompt01)
+ip           : "172.16.1.32"            ← FIP (Type-2 광고 타깃, oscompt01)
 logical_port : <provider LS router port>
-mac          : <FIP external_mac>
+mac          : "fa:16:3e:2f:a7:aa"      ← FIP external_mac
 ```
-> v7 출력엔 `type` 컬럼이 없다(스키마에서 제거됨). FIP 행(172.16.1.32)이 정상 등록되면 OK.
-> FIP의 external_mac은 `kubectl-ko nbctl find nat external_ip=172.16.1.32` 로 확인.
+> v7 출력엔 `type` 컬럼이 없다(스키마에서 제거됨). FIP 행(172.16.1.32 / fa:16:3e:2f:a7:aa)이 정상 등록되면 OK.
+> external_mac 확인: `kubectl-ko nbctl find nat external_ip=172.16.1.32` (NAT type=dnat_and_snat).
 
 ### 8.3 ovn-evpn 포트 활성화 (compute)
 `ovn-evpn-local-ip` + `ovn-evpn-vxlan-ports`를 OVS external_ids에 넣으면 ovn-controller가 br-int에 `ovn-evpn-4789` 포트를 자동 생성.
