@@ -118,7 +118,11 @@ sysctl net.ipv4.ip_forward       # = 1
 
 ## 4. 테스트 환경 구성
 
-VM 2대: (1) provider network 직결, (2) FIP 부착.
+VM 1대를 tenant 네트워크에 띄우고 **FIP 부착**으로 Type-2 광고 테스트.
+
+> 이번 재테스트는 랩 **pl-cyyoon02** 기준 (VM이 `kdvmd-pl-cyyoon02-oscompt01`에 배치).
+> 아래 Phase 5~9의 gw/compute 호스트명·VTEP IP는 이전 랩(pl-cyyoon04) 값이 남아 있으니,
+> pl-cyyoon02 인프라 IP 확정 후 갱신 필요.
 
 ```bash
 ## tenant network/subnet
@@ -126,11 +130,10 @@ openstack network create --availability-zone-hint az1 region01-test-network-az1
 openstack subnet create --network region01-test-network-az1 --gateway 192.168.20.1 \
   --subnet-range 192.168.20.0/24 region01-test-subnet-az1
 
-## provider network (172.16.1.151 ~ 172.16.1.156)
+## provider network (FIP 풀)
 openstack network create --share --external --availability-zone-hint az1 \
   --provider-physical-network physnet1 --provider-network-type flat internal-provider-network
 openstack subnet create --network internal-provider-network \
-  --allocation-pool start=172.16.1.151,end=172.16.1.156 \
   --dns-nameserver 8.8.4.4 --gateway 172.16.1.254 \
   --subnet-range 172.16.1.0/24 internal-provider-subnet
 
@@ -144,26 +147,26 @@ openstack security group create region01-test-sg
 openstack security group rule create --proto icmp region01-test-sg
 openstack security group rule create --proto tcp  region01-test-sg
 
-## VM (1) tenant + FIP
+## VM (tenant + FIP)
 openstack server create --flavor ktc-m1.tiny --network region01-test-network-az1 \
   --image cirros --security-group region01-test-sg --availability-zone az1 region01-vm1
-## VM (2) provider 직결
-openstack server create --flavor ktc-m1.tiny --image cirros \
-  --network internal-provider-network \
-  --availability-zone az1:kdvmd-pl-cyyoon04-oscompt01 test-evpn-vm-direct
 ```
 
 ```text
 $ openstack server list
-| test-evpn-vm-direct | ACTIVE | internal-provider-network=172.16.1.153   |
-| region01-vm1        | ACTIVE | region01-test-network-az1=192.168.20.121 |
+| 6af4180a-2b66-4a42-8ea4-55c22f7f2cd5 | region01-vm1 | ACTIVE | region01-test-network-az1=172.16.1.32, 192.168.20.183 | cirros | ktc-m1.tiny |
+
+$ openstack server show region01-vm1
+| OS-EXT-SRV-ATTR:host | kdvmd-pl-cyyoon02-oscompt01                           |
+| addresses            | region01-test-network-az1=172.16.1.32, 192.168.20.183 |
 ```
+- region01-vm1: tenant fixed **192.168.20.183**, FIP **172.16.1.32**, host **kdvmd-pl-cyyoon02-oscompt01**.
 
 ### FIP 생성/부착
 ```bash
-openstack floating ip create internal-provider-network        # → 172.16.1.156
-openstack server add floating ip region01-vm1 172.16.1.156
-#  region01-vm1: 172.16.1.156, 192.168.20.121
+openstack floating ip create internal-provider-network        # → 172.16.1.32
+openstack server add floating ip region01-vm1 172.16.1.32
+#  region01-vm1: 172.16.1.32, 192.168.20.183
 ```
 
 ---
