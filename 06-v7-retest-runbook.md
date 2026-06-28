@@ -440,18 +440,24 @@ mac          : "fa:16:3e:2f:a7:aa"      ← FIP external_mac
 > v7 출력엔 `type` 컬럼이 없다(스키마에서 제거됨). FIP 행(172.16.1.32 / fa:16:3e:2f:a7:aa)이 정상 등록되면 OK.
 > external_mac 확인: `kubectl-ko nbctl find nat external_ip=172.16.1.32` (NAT type=dnat_and_snat).
 
-### 8.3 ovn-evpn 포트 활성화 (compute)
-`ovn-evpn-local-ip` + `ovn-evpn-vxlan-ports`를 OVS external_ids에 넣으면 ovn-controller가 br-int에 `ovn-evpn-4789` 포트를 자동 생성.
+### 8.3 ovn-evpn 포트 활성화 (compute) — ⚠️ **양 노드 필수 + 포트 생성 확인**
+`ovn-evpn-local-ip` + `ovn-evpn-vxlan-ports`를 OVS external_ids에 넣으면 ovn-controller가 br-int에 **`ovn-evpn-4789` 포트(인바운드 EVPN VXLAN 수신용)** 를 자동 생성한다. **이게 없으면 gw가 보낸 VXLAN(4789)을 받을 포트가 없어 데이터가 드롭** → control plane은 정상인데 ping만 실패한다 (실측: oscompt02 누락으로 한참 헤맴).
 ```bash
 # oscompt01
 ovs-vsctl set Open_vSwitch . \
   external-ids:ovn-evpn-local-ip=172.16.1.27 \
   external-ids:ovn-evpn-vxlan-ports=4789
-# oscompt02
+# oscompt02  ← 빠뜨리기 쉬움!
 ovs-vsctl set Open_vSwitch . \
   external-ids:ovn-evpn-local-ip=172.16.1.28 \
   external-ids:ovn-evpn-vxlan-ports=4789
 ```
+**반드시 양 노드에서 포트 생성 확인:**
+```bash
+ovs-vsctl get Open_vSwitch . external_ids:ovn-evpn-local-ip   # "no key" 나오면 set 안 된 것
+ovs-vsctl list-ports br-int | grep evpn                       # → ovn-evpn-4789 떠야 함
+```
+> FIP가 광고/수신되는 chassis(VM 또는 LR 게이트웨이 chassis 모두 가능)에 **반드시** 이 포트가 있어야 한다. 안 뜨면 `ovn-appctl -t ovn-controller inc-engine/recompute`.
 
 ---
 
@@ -460,13 +466,57 @@ ovs-vsctl set Open_vSwitch . \
 ping src IP는 gw services 대역(172.16.1.20) 명시. `-I br-10`은 br-10에 IP가 없어 src가 api 대역으로 잡혀 응답이 안 돌아온다. FIP는 NAT 1홉 경유라 ttl=63.
 
 ```bash
-# gw 에서 FIP → ttl=63 (NAT 1홉 경유)
-ping -I 172.16.1.20 172.16.1.32 -c 5
-#  64 bytes from 172.16.1.32: ttl=63 ...
+# gw 에서 FIP → ttl=63 (NAT 1홉 경유). <FIP>는 VM에 붙인 실제 값(예: 172.16.1.33)
+ping -I 172.16.1.20 172.16.1.33 -c 5
+#  64 bytes from 172.16.1.33: ttl=63 ...
 #  5 packets transmitted, 5 received, 0% packet loss
 ```
 
-✅ FIP(172.16.1.32) ttl=63, 0% loss → **v7 이미지로 Type-2 FIP 광고 재현 완료.**
+✅ FIP ttl=63, 0% loss → **v7 이미지로 Type-2 FIP 광고 재현 완료.** (실측: pl-cyyoon02에서 region01-vm1 FIP 172.16.1.33, oscompt02 호스팅으로 통과.)
+
+> **chassis 주의**: 분산 FIP는 **provider LS 라우터 포트(=LR 게이트웨이 cr-port)가 resident한 chassis**에서 광고된다 (VM chassis가 아닐 수 있음). pl-cyyoon04는 VM·게이트웨이가 같은 노드라 안 드러났음. **광고/수신 chassis에 8.3의 `ovn-evpn-4789`가 반드시 있어야** 데이터가 통한다.
+
+---
+
+## 10. 트러블슈팅 — control plane vs data plane
+
+ping이 안 될 때 **단계별로 끊어** 어디서 막히는지 본다. control plane(광고)과 data plane(VXLAN 전달)을 분리하는 게 핵심.
+
+### A. Control plane (여기까지 되면 v7 패치는 정상)
+```bash
+# 1) northd: SB advertised_mac 에 FIP 행 (ctrl)
+kubectl-ko sbctl find advertised_mac | grep -A3 <FIP>
+# 2) 광고 chassis FRR: MAC local + ARP local active
+vtysh -c 'show evpn mac vni 10'              # <FIP-MAC> local lo-10
+vtysh -c 'show evpn arp-cache vni 10'        # <FIP> local active
+# 3) gw: Type-2 MAC+IP 학습 + 커널 설치
+vtysh -c 'show bgp l2vpn evpn' | grep <FIP>  # [2]:...[32]:[<FIP>]
+ip neigh show dev br-10 | grep <FIP>         # <FIP> lladdr <MAC> extern_learn proto zebra
+bridge fdb show dev vxlan-10 | grep <MAC>    # <MAC> dst <광고VTEP> self extern_learn
+```
+여기까지 다 되면 **광고는 완벽**. ping 실패면 data plane 문제다 → B.
+
+### B. Data plane (대부분 여기서 막힘)
+```bash
+# 1) 언더레이: gw → 광고 chassis services IP
+ping -c2 <광고chassis-VTEP-IP>               # 0% loss 여야
+
+# 2) ⭐ 광고 chassis에 ovn-evpn-4789 포트 있나 (제일 흔한 누락)
+ovs-vsctl list-ports br-int | grep evpn      # 없으면 → 8.3 external_ids 누락!
+ovs-vsctl get Open_vSwitch . external_ids:ovn-evpn-local-ip   # "no key" = 미설정
+
+# 3) 컨트롤러 로그
+kubectl -n kube-system logs <pod> -c openvswitch --tail=50 | grep -i evpn
+#  "Couldn't find EVPN tunnel for 4789" → ovn-evpn-4789 포트 없음 = 2)가 원인
+```
+**가장 흔한 원인**: 광고/수신 chassis에 `ovn-evpn-4789`가 없음(8.3 external_ids를 그 노드에 안 넣음). set 후 포트 뜨면 즉시 통한다.
+
+### 디버그용 pod 잡기 (`-l app=ovs-ovn` 라벨 안 먹어서 grep)
+```bash
+POD=$(kubectl -n kube-system get pod -o wide --no-headers | awk '/ovs-ovn/ && /oscompt02/{print $1}')
+kubectl -n kube-system exec $POD -c openvswitch -- ovn-appctl -t ovn-controller evpn/vtep-binding-list
+```
+> 컨테이너 이름은 `openvswitch` (단일 컨테이너에 ovs+ovn-controller). `ovs-appctl`을 **호스트에서** 직접 치면 pidfile 못 찾으니 pod 안에서.
 
 ---
 
@@ -480,6 +530,8 @@ ping -I 172.16.1.20 172.16.1.32 -c 5
 6. **provider LS에 localnet 포트 필수** (없으면 NAT이 distributed로 안 잡혀 FIP 광고 안 됨).
 7. **재테스트 cleanup 순서**: OVN 키 제거 → OVS external_ids 제거 → 호스트 인터페이스/라우트 삭제.
 8. **v7 스키마**: `Advertised_MAC_Binding`에 `type` 컬럼 없음. v5(type 有) 위에 v7 in-place 배포 시 ovsdb 스키마 처리 주의(필요 시 `ovsdb-tool convert`).
+9. **⭐ `ovn-evpn-4789` 양 노드 필수**: 광고/수신 chassis에 8.3 external_ids가 없으면 `ovn-evpn-4789` 포트가 안 생겨 인바운드 VXLAN 드롭 → **control plane 정상인데 ping만 실패**. `Couldn't find EVPN tunnel for 4789` 로그가 신호. (이번 PoC ping 실패의 실제 원인.)
+10. **분산 FIP 광고 chassis**: VM chassis가 아니라 **LR 게이트웨이 cr-port chassis**에서 광고됨. 그 chassis에도 호스트 트리오 + FRR + `ovn-evpn-4789`가 있어야 함.
 
 ## 부록 — 참고
 - 변경 diff: <https://github.com/ycy1766/ovn/compare/31e11ad65...evpn-fip-type2-upstream-v7>
