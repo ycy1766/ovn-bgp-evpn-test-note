@@ -476,6 +476,26 @@ ping -I 172.16.1.20 172.16.1.33 -c 5
 
 > **chassis 주의**: 분산 FIP는 **provider LS 라우터 포트(=LR 게이트웨이 cr-port)가 resident한 chassis**에서 광고된다 (VM chassis가 아닐 수 있음). pl-cyyoon04는 VM·게이트웨이가 같은 노드라 안 드러났음. **광고/수신 chassis에 8.3의 `ovn-evpn-4789`가 반드시 있어야** 데이터가 통한다.
 
+### 9.1 멀티-컴퓨트 검증 (VM ≠ 게이트웨이 chassis)
+
+광고는 **게이트웨이 cr-port chassis 한 곳**에서만 나간다(VM 위치 무관). 분산 dnat_and_snat의 인바운드 DNAT는 chassis 고정이 아니므로(northd `build_lrouter_in_dnat_flow`: distributed면 `is_chassis_resident` 안 붙음), 게이트웨이로 들어와도 DNAT 후 오버레이로 VM에 전달돼 **hairpin으로 동작할 것으로 예상**. 라이브 마이그레이션 대신 **비-게이트웨이 노드에 VM을 새로 띄워** 검증:
+
+```bash
+# VM을 oscompt01(비-게이트웨이)에 고정 생성 + FIP
+openstack server create --flavor ktc-m1.tiny --network region01-test-network-az1 \
+  --image cirros --security-group region01-test-sg \
+  --availability-zone az1:kdvmd-pl-cyyoon02-oscompt01 region01-vm2
+openstack server show region01-vm2 -f value -c OS-EXT-SRV-ATTR:host   # → oscompt01
+openstack floating ip create internal-provider-network               # → <FIP2>
+openstack server add floating ip region01-vm2 <FIP2>
+
+# gw — 광고는 게이트웨이(.28)에서, VM은 oscompt01
+vtysh -c 'show evpn mac vni 10' | grep <FIP2-MAC>     # remote 172.16.1.28 (게이트웨이)
+ping -I 172.16.1.20 <FIP2> -c 5                        # ttl=63 기대(게이트웨이 hairpin)
+```
+- 성공 → 멀티컴퓨트 OK(인바운드는 게이트웨이 중앙집중 hairpin, 진짜 분산 인바운드는 아님 = future optimization).
+- 실패 → VM-chassis 광고 필요(northd advertised_mac을 라우터 포트 대신 `nat->logical_port`(VM 포트)로). native GARP가 `is_chassis_resident(nat->logical_port)`인 점과 일치시키는 방향.
+
 ---
 
 ## 10. 트러블슈팅 — control plane vs data plane
