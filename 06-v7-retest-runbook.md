@@ -294,9 +294,11 @@ ovn-appctl -t ovn-controller evpn/vtep-binding-list 2>/dev/null     # 비어 있
 
 ### 6.3 OVN LS dynamic-routing 키 초기화 (ctrl 노드)
 ```bash
-# provider LS UUID 확인 (pl-cyyoon02 실값)
-LS="neutron-$(openstack network show internal-provider-network -f value -c id)"
-#  = neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a
+# provider LS 이름 = neutron-<provider-net-uuid> (접두사 neutron- 필수!)
+# openstack CLI는 openstack-client pod 전용이라 ctrl 노드에선 UUID 직접 지정.
+LS=neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a
+#  net UUID 확인(openstack-client pod): openstack network show internal-provider-network -f value -c id
+#  OVN에서 확인(ctrl 노드):              kubectl-ko nbctl show | grep -B1 'type: localnet'
 echo $LS
 for k in dynamic-routing-vni dynamic-routing-bridge-ifname \
          dynamic-routing-vxlan-ifname dynamic-routing-advertise-ifname \
@@ -367,12 +369,11 @@ vtysh -c 'show evpn vni'
 ### 8.1 provider LS에 dynamic-routing 키 추가
 OVN northd가 NB Logical_Switch 설정을 읽어 SB에 광고 엔트리를 생성.
 ```bash
-# provider LS 확인 (localnet 포트 보유)
+# provider LS 확인 (localnet 포트 보유) — ctrl 노드에서 OVN으로 직접 확인
 kubectl-ko nbctl show | grep -B1 'type: localnet'
-#  switch <uuid> (neutron-<provider-net-uuid>) (aka internal-provider-network)
+#  switch <uuid> (neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a) (aka internal-provider-network)
 
-LS="neutron-$(openstack network show internal-provider-network -f value -c id)"
-#  = neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a
+LS=neutron-e6a34482-31cb-4bdb-86b7-926c7c7ee28a
 kubectl-ko nbctl set Logical_Switch $LS \
     other_config:dynamic-routing-vni=10 \
     other_config:dynamic-routing-bridge-ifname=br-10 \
