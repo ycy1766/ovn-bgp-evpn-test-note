@@ -1,4 +1,4 @@
-# v7 Type-2 FIP BGP-EVPN 테스트 런북 (현재 이미지 기준, pl-cyyoon04)
+# v7 Type-2 FIP BGP-EVPN 테스트 런북 (현재 이미지 기준, pl-cyyoon02)
 
 OVN Native BGP-EVPN을 사용하기 위해 kube-ovn 이미지 내 OVN 버전을 **26.03 이상**으로 올려, OpenStack Floating IP / provider-direct VM을 **EVPN Type-2 (MAC+IP)** 로 광고하는 테스트. 테스트 목적으로 내부 빌드 이미지를 배포 후 확인.
 
@@ -73,8 +73,13 @@ spec:
 ```
 
 ### 2.2 소켓/로그 경로 권한 수정 (ovn-central 노드)
+> pl-cyyoon02는 `kube_ovn_central_hosts = ovn_network_nodes` = oscompt01/02. ovn-central 노드 IP는 아래로 확인.
 ```bash
-for node in 10.21.1.21 10.21.1.22 10.21.1.23; do
+# ovn-central 노드 확인
+kubectl -n kube-system get pod -l app=ovn-central -o wide
+
+# ovn_network_nodes(oscompt01/02) api IP
+for node in 10.21.1.27 10.21.1.28; do
     ssh $node 'chown -R nobody:nogroup /var/run/ovn /var/log/ovn'
 done
 ```
@@ -120,9 +125,15 @@ sysctl net.ipv4.ip_forward       # = 1
 
 VM 1대를 tenant 네트워크에 띄우고 **FIP 부착**으로 Type-2 광고 테스트.
 
-> 이번 재테스트는 랩 **pl-cyyoon02** 기준 (VM이 `kdvmd-pl-cyyoon02-oscompt01`에 배치).
-> 아래 Phase 5~9의 gw/compute 호스트명·VTEP IP는 이전 랩(pl-cyyoon04) 값이 남아 있으니,
-> pl-cyyoon02 인프라 IP 확정 후 갱신 필요.
+> 랩 **pl-cyyoon02** 기준 (VM이 `kdvmd-pl-cyyoon02-oscompt01`에 배치). 노드/IP 매핑:
+>
+> | 역할 | 호스트 | services(VTEP/BGP) IP | ASN |
+> |------|--------|------------------------|-----|
+> | gw | kdvmd-pl-cyyoon02-gw | 172.16.1.20 | 65000 |
+> | compute (VM 위치) | kdvmd-pl-cyyoon02-oscompt01 | 172.16.1.27 | 65001 |
+> | compute | kdvmd-pl-cyyoon02-oscompt02 | 172.16.1.28 | 65001 |
+>
+> provider(FIP) 풀 `172.16.1.31~39`, VIP `172.16.1.30`, services NIC `ens8`, VNI 10.
 
 ```bash
 ## tenant network/subnet
@@ -209,15 +220,15 @@ VNI=10
 ip link del vxlan-${VNI} 2>/dev/null
 ip link del lo-${VNI}    2>/dev/null
 ip link del br-${VNI}    2>/dev/null
-# VM IP를 br-10으로 보내던 /32 라우트 제거
-for ip in 151 152 153 154 155 156; do ip route del 172.16.1.${ip}/32 dev br-10 2>/dev/null; done
-ip route show | grep -E '172\.16\.1\.(151|152|153|154|155|156)/32' || echo "clean"
+# VM/FIP IP를 br-10으로 보내던 /32 라우트 제거 (provider 풀 31~39)
+for ip in $(seq 31 39); do ip route del 172.16.1.${ip}/32 dev br-10 2>/dev/null; done
+ip route show | grep -E '172\.16\.1\.3[1-9]/32' || echo "clean"
 ```
 
 ### 5.3 호스트 인터페이스 생성
-> br-10에 IP를 주면 services NIC와 같은 서브넷(172.16.1.0/24) 충돌. **br-10은 L2 bridge로만 사용, IP 미부여.** VM 통신 src IP는 services NIC의 172.16.1.160 사용.
+> br-10에 IP를 주면 services NIC와 같은 서브넷(172.16.1.0/24) 충돌. **br-10은 L2 bridge로만 사용, IP 미부여.** VM 통신 src IP는 gw services NIC의 172.16.1.20 사용.
 ```bash
-VNI=10; LOCAL_IP=172.16.1.160
+VNI=10; LOCAL_IP=172.16.1.20          # gw services IP
 ip link add br-10 type bridge && ip link set br-10 up
 ip link add vxlan-10 type vxlan id ${VNI} local ${LOCAL_IP} dstport 4789
 ip link set vxlan-10 master br-10 && ip link set vxlan-10 up
@@ -227,9 +238,9 @@ ip -d link show vxlan-10 | grep dstport       # dstport 4789
 ```
 
 ### 5.4 호스트 라우팅
-> 테스트 환경상 service/광고 인터페이스가 한 NIC에 몰려있음 (실 환경은 분리 필요). VM IP(151~156)만 br-10으로, VTEP(157/159)·default GW는 services 그대로.
+> 테스트 환경상 service/광고 인터페이스가 한 NIC에 몰려있음 (실 환경은 분리 필요). FIP 풀(31~39)만 br-10으로, VTEP(27/28)·default GW는 services 그대로.
 ```bash
-for ip in 151 152 153 154 155 156; do ip route add 172.16.1.${ip}/32 dev br-10 2>/dev/null; done
+for ip in $(seq 31 39); do ip route add 172.16.1.${ip}/32 dev br-10 2>/dev/null; done
 ```
 
 ### 5.5 FRR 설정
@@ -238,17 +249,17 @@ for ip in 151 152 153 154 155 156; do ip route add 172.16.1.${ip}/32 dev br-10 2
 cat > /etc/frr/frr.conf <<'EOF'
 frr version 8.4.4
 frr defaults datacenter
-hostname kdvmd-pl-cyyoon04-gw
+hostname kdvmd-pl-cyyoon02-gw
 no ipv6 forwarding
 service integrated-vtysh-config
 !
 router bgp 65000
- bgp router-id 172.16.1.160
+ bgp router-id 172.16.1.20
  no bgp default ipv4-unicast
  neighbor EVPN peer-group
  neighbor EVPN remote-as 65001
- neighbor 172.16.1.157 peer-group EVPN
- neighbor 172.16.1.159 peer-group EVPN
+ neighbor 172.16.1.27 peer-group EVPN
+ neighbor 172.16.1.28 peer-group EVPN
  !
  address-family l2vpn evpn
   neighbor EVPN activate
@@ -282,7 +293,10 @@ ovn-appctl -t ovn-controller evpn/vtep-binding-list 2>/dev/null     # 비어 있
 
 ### 6.3 OVN LS dynamic-routing 키 초기화 (ctrl 노드)
 ```bash
-LS=neutron-73dbaf22-d6f7-44c7-82cf-42411c61c71c
+# provider LS UUID 확인 (pl-cyyoon02 실값으로)
+LS="neutron-$(openstack network show internal-provider-network -f value -c id)"
+#  또는: kubectl-ko nbctl show | grep -B1 'type: localnet'
+echo $LS
 for k in dynamic-routing-vni dynamic-routing-bridge-ifname \
          dynamic-routing-vxlan-ifname dynamic-routing-advertise-ifname \
          dynamic-routing-redistribute; do
@@ -292,10 +306,10 @@ kubectl-ko nbctl get Logical_Switch $LS other_config     # 키 없어야
 kubectl-ko sbctl find advertised_mac                     # 비어 있어야
 ```
 
-### 6.4 호스트 인터페이스 (oscompt01: LOCAL_IP=157 / oscompt02: 159)
+### 6.4 호스트 인터페이스 (oscompt01: LOCAL_IP=27 / oscompt02: 28)
 > br-10: L2 학습/광고 bridge. lo-10: static FDB 광고용 dummy(ovn-controller가 `advertised_mac`의 VM MAC을 RTM_NEWNEIGH로 주입). vxlan-10: remote VTEP 학습, `nolearning`으로 FRR static FDB와 자가학습 충돌 회피.
 ```bash
-VNI=10; LOCAL_IP=172.16.1.157         # oscompt02는 172.16.1.159
+VNI=10; LOCAL_IP=172.16.1.27          # oscompt02는 172.16.1.28
 ip link add br-10 type bridge && ip link set br-10 up
 ip link add vxlan-10 type vxlan id ${VNI} local ${LOCAL_IP} dstport 60010 nolearning
 ip link set vxlan-10 master br-10 && ip link set vxlan-10 up
@@ -304,22 +318,22 @@ ip link set lo-10 master br-10 && ip link set lo-10 up
 ip -d link show vxlan-10 | grep dstport       # dstport 60010
 ```
 
-### 6.5 FRR 설정 (oscompt01 예시; oscompt02는 hostname/router-id만 159로)
+### 6.5 FRR 설정 (oscompt01 예시; oscompt02는 hostname/router-id만 172.16.1.28로)
 ```bash
 cat > /etc/frr/frr.conf <<'EOF'
 frr version 8.4.4
 frr defaults datacenter
-hostname kdvmd-pl-cyyoon04-oscompt01
+hostname kdvmd-pl-cyyoon02-oscompt01
 no ipv6 forwarding
 service integrated-vtysh-config
 !
 router bgp 65001
- bgp router-id 172.16.1.157
+ bgp router-id 172.16.1.27
  no bgp default ipv4-unicast
- neighbor 172.16.1.160 remote-as 65000
+ neighbor 172.16.1.20 remote-as 65000
  !
  address-family l2vpn evpn
-  neighbor 172.16.1.160 activate
+  neighbor 172.16.1.20 activate
   advertise-all-vni
  exit-address-family
 !
@@ -334,8 +348,8 @@ systemctl restart frr
 ```bash
 # gw
 vtysh -c 'show bgp l2vpn evpn summary'
-#  oscompt01(172.16.1.157) ... State/PfxRcd 1   PfxSnt 3
-#  oscompt02(172.16.1.159) ... State/PfxRcd 1   PfxSnt 3
+#  oscompt01(172.16.1.27) ... State/PfxRcd 1   PfxSnt 3
+#  oscompt02(172.16.1.28) ... State/PfxRcd 1   PfxSnt 3
 #  Total number of neighbors 2
 vtysh -c 'show evpn vni'
 #  10  L2  vxlan-10  ...  # Remote VTEPs 2  default
@@ -353,11 +367,10 @@ vtysh -c 'show evpn vni'
 OVN northd가 NB Logical_Switch 설정을 읽어 SB에 광고 엔트리를 생성.
 ```bash
 # provider LS 확인 (localnet 포트 보유)
-kubectl-ko nbctl show | grep -A2 "internal-provider"
-#  switch ... (neutron-73dbaf22-...) (aka internal-provider-network)
-#      port provnet-...  type: localnet
+kubectl-ko nbctl show | grep -B1 'type: localnet'
+#  switch <uuid> (neutron-<provider-net-uuid>) (aka internal-provider-network)
 
-LS=neutron-73dbaf22-d6f7-44c7-82cf-42411c61c71c
+LS="neutron-$(openstack network show internal-provider-network -f value -c id)"
 kubectl-ko nbctl set Logical_Switch $LS \
     other_config:dynamic-routing-vni=10 \
     other_config:dynamic-routing-bridge-ifname=br-10 \
@@ -377,32 +390,25 @@ kubectl-ko nbctl get Logical_Switch $LS other_config
 kubectl-ko sbctl find advertised_mac
 ```
 ```text
-_uuid        : cb140430-...
-datapath     : 88bcacc8-...
-ip           : "172.16.1.152"
-logical_port : 64394b09-...
-mac          : "fa:16:3e:f1:df:b4"
-
-ip           : "172.16.1.156"      ← FIP (Type-2 광고 타깃)
-logical_port : 64394b09-...
-mac          : "fa:16:3e:1e:22:45"
-
-ip           : "172.16.1.153"      ← provider 직결 VM
-logical_port : eabe5472-...
-mac          : "fa:16:3e:df:48:35"
+_uuid        : <uuid>
+datapath     : <provider LS datapath>
+ip           : "172.16.1.32"       ← FIP (Type-2 광고 타깃, oscompt01)
+logical_port : <provider LS router port>
+mac          : <FIP external_mac>
 ```
-> v7 출력엔 `type` 컬럼이 없다(스키마에서 제거됨). FIP/직결 VM 행이 정상 등록되면 OK.
+> v7 출력엔 `type` 컬럼이 없다(스키마에서 제거됨). FIP 행(172.16.1.32)이 정상 등록되면 OK.
+> FIP의 external_mac은 `kubectl-ko nbctl find nat external_ip=172.16.1.32` 로 확인.
 
 ### 8.3 ovn-evpn 포트 활성화 (compute)
 `ovn-evpn-local-ip` + `ovn-evpn-vxlan-ports`를 OVS external_ids에 넣으면 ovn-controller가 br-int에 `ovn-evpn-4789` 포트를 자동 생성.
 ```bash
 # oscompt01
 ovs-vsctl set Open_vSwitch . \
-  external-ids:ovn-evpn-local-ip=172.16.1.157 \
+  external-ids:ovn-evpn-local-ip=172.16.1.27 \
   external-ids:ovn-evpn-vxlan-ports=4789
 # oscompt02
 ovs-vsctl set Open_vSwitch . \
-  external-ids:ovn-evpn-local-ip=172.16.1.159 \
+  external-ids:ovn-evpn-local-ip=172.16.1.28 \
   external-ids:ovn-evpn-vxlan-ports=4789
 ```
 
@@ -410,21 +416,16 @@ ovs-vsctl set Open_vSwitch . \
 
 ## 9. VM 통신 테스트
 
-ping src IP는 services 대역(172.16.1.160) 명시. `-I br-10`은 br-10에 IP가 없어 src가 api 대역으로 잡혀 응답이 안 돌아온다. FIP(156)=ttl 63(NAT 1홉), direct(153)=ttl 64.
+ping src IP는 gw services 대역(172.16.1.20) 명시. `-I br-10`은 br-10에 IP가 없어 src가 api 대역으로 잡혀 응답이 안 돌아온다. FIP는 NAT 1홉 경유라 ttl=63.
 
 ```bash
-# provider 직결 VM → ttl=64
-ping -I 172.16.1.160 172.16.1.153 -c 5
-#  64 bytes from 172.16.1.153: ttl=64 ...
-#  5 packets transmitted, 5 received, 0% packet loss
-
-# FIP → ttl=63 (NAT 1홉 경유)
-ping -I 172.16.1.160 172.16.1.156 -c 5
-#  64 bytes from 172.16.1.156: ttl=63 ...
+# gw 에서 FIP → ttl=63 (NAT 1홉 경유)
+ping -I 172.16.1.20 172.16.1.32 -c 5
+#  64 bytes from 172.16.1.32: ttl=63 ...
 #  5 packets transmitted, 5 received, 0% packet loss
 ```
 
-✅ FIP(156) ttl=63, direct(153) ttl=64, 둘 다 0% loss → **v7 이미지로 Type-2 FIP 광고 재현 완료.**
+✅ FIP(172.16.1.32) ttl=63, 0% loss → **v7 이미지로 Type-2 FIP 광고 재현 완료.**
 
 ---
 
@@ -432,7 +433,7 @@ ping -I 172.16.1.160 172.16.1.156 -c 5
 
 1. **OVN 버전**: stock(25.03) 아닌 26.03 이미지 필수. `nbctl --version`으로 26.03.90 확인.
 2. **ovs-ovn 권한**: `runAsUser:0 + privileged:true` 없으면 RTM_NEWNEIGH 실패 → static FDB inject 안 됨.
-3. **br-10 IP 금지** (services 서브넷 충돌). ping src는 services IP(.160).
+3. **br-10 IP 금지** (services 서브넷 충돌). ping src는 gw services IP(172.16.1.20).
 4. **compute vxlan `nolearning`** (FRR static FDB 충돌 회피).
 5. **frr defaults datacenter** (traditional이면 EVPN 차단).
 6. **provider LS에 localnet 포트 필수** (없으면 NAT이 distributed로 안 잡혀 FIP 광고 안 됨).
